@@ -671,3 +671,207 @@ static void vendor_deferred_resume_worker(struct work_struct *work)
  1. Hệ thống vẫn resume cực nhanh (như bạn đã thấy: ~260ms).
  2. Sau khi màn hình sáng lên khoảng chưa tới 1 giây (msleep(800)), bạn sẽ thấy log in ra [HACK] Async Worker: Ép USB Reset....
  3. Lúc này, MediaTek driver sẽ bị Kernel "đá" một phát, buộc nó phải chạy lại tiến trình mtk_usb_reset_resume(). WiFi và Bluetooth sẽ sống lại ngay lập tức ở background mà không làm "kẹt" thời gian boot tổng của hệ thống.
+
+
+
+
+
+
+Dưới đây là file tài liệu đặc tả và hướng dẫn chi tiết (định dạng Markdown). Bạn có thể copy toàn bộ nội dung này lưu thành file usb_event_driven_resume_spec.md để cung cấp cho Cline hoặc team phát triển.
+```markdown
+# Specification & Implementation Guide: Event-Driven USB Deferred Resume
+
+## 1. Tổng quan dự án (Overview)
+- **Vấn đề:** Các module USB WiFi/Bluetooth ngoại vi (đặc biệt của vendor MediaTek) có thời gian khôi phục (resume/reset) quá lâu (~450ms). Khi hệ thống wake up từ trạng thái suspend, Linux Power Management (PM) Core gọi hàm `usb_dev_resume` và bị block lại chờ thiết bị này khởi động xong. Điều này khiến tổng thời gian PM log tăng vọt lên 700-800ms, làm chậm quá trình sáng màn hình và kết nối mạng.
+- **Giải pháp:** Áp dụng kỹ thuật **Event-Driven Deferred Resume** can thiệp trực tiếp (In-tree patch) vào kernel core.
+    1. Lừa PM Core bằng cách trả về `0` (Success) ngay lập tức tại hàm `usb_dev_resume` đối với thiết bị bị chậm.
+    2. Giao việc khởi động lại thiết bị cho một luồng Worker chạy ngầm.
+    3. Để tránh lỗi thiết bị "ngủ luôn" hoặc treo máy do chưa có điện, luồng Worker này sẽ bị **block** (chờ đợi) cho đến khi PM Core hoàn tất rã đông toàn bộ hệ thống (bắt sự kiện `PM_POST_SUSPEND`).
+    4. Sau khi nhận sự kiện, Worker dùng lệnh `usb_reset_device` để ép cổng USB khởi động lại phần cứng một cách an toàn.
+
+---
+
+## 2. Đặc tả Yêu cầu (Technical Specification)
+- **Target File:** `drivers/usb/core/driver.c`
+- **Hook Point:** `usb_dev_resume(struct device *dev)`
+- **Concurrency & Event Mechanisms:**
+    - `struct workqueue_struct`: Dùng global workqueue (`schedule_work`) để chạy background task.
+    - `struct notifier_block`: Đăng ký qua `register_pm_notifier` để bắt event của PM Core.
+    - `struct completion`: Dùng `DECLARE_COMPLETION`, `wait_for_completion`, và `complete_all` để đồng bộ hóa an toàn giữa PM Event và Worker thread (thay thế cho việc sleep hardcode).
+- **Quy tắc bộ nhớ:** BẮT BUỘC dùng `GFP_NOIO` khi cấp phát bộ nhớ trong ngữ cảnh `usb_dev_resume` để tránh Deadlock I/O.
+- **Reference Counting:** BẮT BUỘC gọi `usb_get_dev` để giữ thiết bị không bị giải phóng nếu người dùng rút USB ra giữa chừng.
+
+---
+
+## 3. Hướng dẫn Code Step-by-Step (Implementation)
+
+Mở file `drivers/usb/core/driver.c` và thực hiện các bước sau.
+
+### Bước 1: Thêm thư viện
+Khai báo các header cần thiết ở đầu file (nếu chưa có):
+```c
+#include <linux/workqueue.h>
+#include <linux/slab.h>
+#include <linux/suspend.h>     /* Cho PM Notifier */
+#include <linux/completion.h>  /* Cho Completion mechanisms */
+
+```
+### Bước 2: Viết logic Event Notifier và Worker
+Tìm đến ngay phía trên hàm usb_dev_resume. Thêm toàn bộ block code quản lý luồng ngầm sau:
+```c
+/* ======================================================================= *
+ * IN-TREE HACK: EVENT-DRIVEN DEFERRED RESUME CHO VENDOR WIFI/BT MODULE    *
+ * ======================================================================= */
+
+/* 1. Khởi tạo chốt chặn Completion */
+static DECLARE_COMPLETION(vendor_resume_comp);
+
+/* 2. PM Notifier Callback để bắt event hệ thống */
+static int vendor_pm_notify(struct notifier_block *nb, unsigned long action, void *ptr)
+{
+    switch (action) {
+    case PM_SUSPEND_PREPARE:
+        /* Reset chốt chặn trước khi hệ thống đi ngủ */
+        reinit_completion(&vendor_resume_comp);
+        break;
+    case PM_POST_SUSPEND:
+        /* Hệ thống đã thức dậy hoàn toàn (rã đông xong). Mở chốt cho các worker. */
+        complete_all(&vendor_resume_comp);
+        break;
+    }
+    return NOTIFY_OK;
+}
+
+static struct notifier_block vendor_pm_nb = {
+    .notifier_call = vendor_pm_notify,
+};
+
+/* 3. Hàm init tự động đăng ký Notifier khi boot */
+static int __init vendor_hack_init(void)
+{
+    register_pm_notifier(&vendor_pm_nb);
+    return 0;
+}
+late_initcall(vendor_hack_init); /* Đăng ký muộn để đảm bảo kernel boot ổn định */
+
+/* 4. Context và Worker Function */
+struct vendor_deferred_resume_ctx {
+    struct work_struct work;
+    struct usb_device *udev;
+};
+
+static void vendor_deferred_resume_worker(struct work_struct *work)
+{
+    struct vendor_deferred_resume_ctx *ctx = 
+        container_of(work, struct vendor_deferred_resume_ctx, work);
+    struct usb_device *udev = ctx->udev;
+
+    dev_info(&udev->dev, "[HACK-WIFI] Worker đang ngủ chờ PM_POST_SUSPEND...\n");
+    
+    /* Block luồng này lại, không tốn CPU, chờ hệ thống thức dậy 100% */
+    wait_for_completion(&vendor_resume_comp);
+
+    dev_info(&udev->dev, "[HACK-WIFI] Nhận event PM_POST_SUSPEND! Ép USB Reset...\n");
+    
+    /* Lock thiết bị trước khi can thiệp phần cứng */
+    usb_lock_device(udev);
+    
+    /* Dùng lệnh ép reset để đánh thức thiết bị và bắt vendor driver nạp lại */
+    int ret = usb_reset_device(udev);
+    if (ret) {
+        dev_err(&udev->dev, "[HACK-WIFI] Lỗi khi reset thiết bị: %d\n", ret);
+    }
+    
+    usb_unlock_device(udev);
+    
+    dev_info(&udev->dev, "[HACK-WIFI] Hoàn tất quá trình đánh thức ngầm.\n");
+    
+    /* Dọn dẹp memory và reference */
+    usb_put_dev(udev);
+    kfree(ctx);
+}
+/* ======================================================================= */
+
+```
+### Bước 3: Đặt trạm chặn (Intercept) trong usb_dev_resume
+Tìm hàm usb_dev_resume và chèn đoạn logic kiểm tra Vendor ID (VID) vào ngay đầu hàm.
+```c
+static int usb_dev_resume(struct device *dev)
+{
+    struct usb_device *udev = to_usb_device(dev);
+    int r;
+
+    /* --- BẮT ĐẦU CHẶN --- */
+    /* TODO: CẬP NHẬT ĐÚNG VENDOR ID (VID) CỦA MODULE CHẬM (Ví dụ: 0x0E8D là MediaTek) */
+    if (le16_to_cpu(udev->descriptor.idVendor) == 0x0E8D) {
+        struct vendor_deferred_resume_ctx *ctx;
+        
+        /* Cấp phát bộ nhớ với GFP_NOIO để chống Deadlock I/O khi hệ thống đang ngủ */
+        ctx = kzalloc(sizeof(*ctx), GFP_NOIO);
+        if (ctx) {
+            ctx->udev = usb_get_dev(udev); 
+            INIT_WORK(&ctx->work, vendor_deferred_resume_worker);
+            
+            dev_info(&udev->dev, "[HACK-WIFI] Chặn PM resume, bàn giao cho Worker ngầm!\n");
+            
+            /* Lên lịch chạy Worker */
+            schedule_work(&ctx->work);
+            
+            /* Bypass luồng đồng bộ, trả về Thành công ngay lập tức cho PM Core */
+            return 0; 
+        } else {
+            dev_err(&udev->dev, "[HACK-WIFI] Hết RAM, fallback về sync resume gốc!\n");
+        }
+    }
+    /* --- KẾT THÚC CHẶN --- */
+
+    /* Logic gốc của Kernel dành cho các thiết bị USB khác */
+    r = usb_resume(udev, PMSG_RESUME);
+    return r;
+}
+
+```
+## 4. Biên dịch và Kiểm thử
+### 4.1. Biên dịch Kernel
+Sau khi sửa code, bạn cần build lại phần core của kernel.
+```bash
+# Lệnh build tham khảo (thay đổi tùy môi trường/board)
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image -j8
+
+```
+*Ghi Image mới vào board thiết bị.*
+### 4.2. Kịch bản Test (Test Case)
+ 1. **Chuẩn bị:** Khởi động board, lấy dmesg log.
+   ```bash
+   dmesg -c > /dev/null
+   
+   ```
+ 2. **Kích hoạt Suspend:**
+   ```bash
+   echo mem > /sys/power/state
+   
+   
+   ```
+```
+3. **Đánh thức hệ thống:** Nhấn nút nguồn/GPIO để wake up.
+4. **Đọc và Phân tích Log:**
+   ```bash
+   dmesg | grep -iE "hack-wifi|dpm_callback|pm:"
+   
+
+```
+### 4.3. Kết quả kỳ vọng (Expected Dmesg Flow)
+Trình tự log dmesg bắt buộc phải tuân theo thứ tự sau để chứng minh logic hoạt động đúng:
+ 1. [HACK-WIFI] Chặn PM resume, bàn giao cho Worker ngầm! (Báo hiệu Intercept thành công).
+ 2. [HACK-WIFI] Worker đang ngủ chờ PM_POST_SUSPEND... (Worker chạy nhưng bị chặn lại).
+ 3. PM: dpm_callback : 1.2 msec / ... usb_dev_resume+... (Thời gian resume của PM siêu thấp ~1ms thay vì ~450ms).
+ 4. PM: resume of devices complete after 262 msecs (Hệ thống boot xong, phát event PM_POST_SUSPEND).
+ 5. [HACK-WIFI] Nhận event PM_POST_SUSPEND! Ép USB Reset... (Worker mở khóa chốt, bắt đầu xử lý phần cứng).
+ 6. Các log gốc của Vendor Driver bắt đầu in ra (khôi phục WiFi/BT).
+ 7. [HACK-WIFI] Hoàn tất quá trình đánh thức ngầm.
+```
+
+
+```
+
+
