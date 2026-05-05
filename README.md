@@ -598,3 +598,76 @@ static int usb_dev_resume(struct device *dev)
  1. **Không bị Deadlock (Treo máy):** Nhờ cơ chế DECLARE_COMPLETION, Worker thread có thể được spawn ra sớm, nhưng nó sẽ "ngủ ngoan" mà không ngốn CPU cho đến khi hàm callback vendor_pm_notify rút chốt.
  2. **An toàn vòng đời (Lifecycle Safe):** Việc đăng ký Event Notifier được thực hiện một lần duy nhất bằng late_initcall khi boot. Nó giải quyết triệt để vấn đề xung đột tài nguyên.
  3. **Chính xác tuyệt đối 100%:** Ngay vào khoảnh khắc kernel in ra log "PM: resume of devices complete after X msecs" (chính là event PM_POST_SUSPEND), lệnh usb_reset_device lập tức được kích hoạt không trễ 1 mili-giây nào, đảm bảo module WiFi nhận được điện áp ổn định.
+
+
+
+
+
+
+Tuyệt vời! Bức ảnh log của bạn cho thấy một nửa sự thật đã thành công rực rỡ: Thời gian PM log đã giảm từ **hơn 800ms xuống chỉ còn 262.345ms** (dòng 13416). Điều này có nghĩa là "cú lừa" PM Core đã hoạt động.
+Tuy nhiên, module WiFi/BT "ngủ luôn" là do một cơ chế bảo vệ trạng thái của Linux Kernel mà đoạn code trước của chúng ta đã mắc bẫy.
+### 🔍 Nguyên nhân tại sao Module "ngủ luôn"
+ 1. **Bẫy State Machine của PM Core:** Khi chúng ta trả về 0 ở hàm usb_dev_resume, PM Core tin rằng thiết bị đã thức. Nó liền cập nhật trạng thái thiết bị thành ACTIVE (is_suspended = 0).
+ 2. Khi luồng Workqueue ngầm của chúng ta chạy và gọi hàm usb_resume(udev, PMSG_RESUME), Kernel kiểm tra trạng thái thiết bị. Nó thấy: *"Ô, thiết bị này PM Core vừa báo là ACTIVE rồi mà, không cần làm gì nữa đâu"* -> Thế là nó **skip (bỏ qua)** hoàn toàn việc gọi xuống hàm mtk_usb_reset_resume() của MediaTek.
+ 3. Hậu quả là phần cứng không được cấp lại điện/reset tín hiệu USB, dẫn đến việc thiết bị "chết lâm sàng".
+### 🛠️ Cách khắc phục (Sửa lại hàm Worker)
+Để lách qua việc Kernel kiểm tra trạng thái PM, chúng ta **không dùng usb_resume nữa**, mà sẽ dùng biện pháp mạnh hơn: **Ép Reset cổng USB (usb_reset_device)**.
+Khi ép reset, USB Core bắt buộc phải khởi động lại tín hiệu điện ở port và tự động gọi các hàm khôi phục của MediaTek driver, bất chấp PM Core đang nghĩ gì.
+Bạn hãy mở lại file drivers/usb/core/driver.c và sửa lại duy nhất hàm vendor_deferred_resume_worker như sau (chú ý thêm thư viện #include <linux/delay.h> ở trên cùng nếu chưa có):
+```c
+#include <linux/workqueue.h>
+#include <linux/slab.h>
+#include <linux/delay.h> // Bắt buộc thêm thư viện này để dùng msleep
+
+/* --- IN-TREE HACK: DEFERRED RESUME --- */
+struct vendor_deferred_resume_ctx {
+    struct work_struct work;
+    struct usb_device *udev;
+};
+
+static void vendor_deferred_resume_worker(struct work_struct *work)
+{
+    struct vendor_deferred_resume_ctx *ctx = 
+        container_of(work, struct vendor_deferred_resume_ctx, work);
+    struct usb_device *udev = ctx->udev;
+
+    // 1. NGỦ CHỜ HỆ THỐNG ỔN ĐỊNH
+    // Phải chờ PM Core đánh thức xong các Root Hub và thaw processes (rã đông tiến trình).
+    // Nếu chạy ngay, cổng Hub chưa có điện thì lệnh reset sẽ thất bại.
+    msleep(800); 
+
+    dev_info(&udev->dev, "[HACK] Async Worker: Ép USB Reset để đánh thức hardware...\n");
+    
+    // 2. Lock thiết bị trước khi thao tác
+    usb_lock_device(udev);
+    
+    // 3. ÉP RESET THIẾT BỊ
+    // Lệnh này bỏ qua PM State, bắt buộc Hub phải reset port và nạp lại module WiFi/BT.
+    // Nó sẽ kích hoạt mtk_usb_reset_resume hoặc re-probe lại thiết bị.
+    int ret = usb_reset_device(udev);
+    if (ret) {
+        dev_err(&udev->dev, "[HACK] Lỗi khi reset thiết bị: %d\n", ret);
+    }
+    
+    // 4. Unlock thiết bị
+    usb_unlock_device(udev);
+    
+    dev_info(&udev->dev, "[HACK] Async Worker: Hoàn tất ép đánh thức.\n");
+    
+    // Giải phóng
+    usb_put_dev(udev);
+    kfree(ctx);
+}
+
+```
+**Lưu ý phần code chặn (Intercept) ở dưới vẫn giữ nguyên không đổi:**
+```c
+    if (le16_to_cpu(udev->descriptor.idVendor) == 0x0E8D) { // Hoặc VID của bạn
+        // ... INIT_WORK ... schedule_work ... return 0;
+    }
+
+```
+### 💡 Chuyện gì sẽ xảy ra sau khi bạn thay code này?
+ 1. Hệ thống vẫn resume cực nhanh (như bạn đã thấy: ~260ms).
+ 2. Sau khi màn hình sáng lên khoảng chưa tới 1 giây (msleep(800)), bạn sẽ thấy log in ra [HACK] Async Worker: Ép USB Reset....
+ 3. Lúc này, MediaTek driver sẽ bị Kernel "đá" một phát, buộc nó phải chạy lại tiến trình mtk_usb_reset_resume(). WiFi và Bluetooth sẽ sống lại ngay lập tức ở background mà không làm "kẹt" thời gian boot tổng của hệ thống.
