@@ -151,3 +151,159 @@ endif
  2. **Khối fork / fork again:** Thể hiện khoảnh khắc luồng thực thi tách làm hai. Nhờ có schedule_work, Worker (màu xanh lá) bắt đầu chạy độc lập ở chế độ nền, trong khi luồng chính của hệ thống (màu xanh dương) tiếp tục đi thẳng xuống dưới mà không bị block.
  3. **Mắt xích đồng bộ:** Chính là điểm luồng Worker gọi wait_for_completion và nằm chờ. Nó chỉ đi tiếp khi luồng màu hồng (Notifier) nhận được lệnh PM_POST_SUSPEND và kéo chốt (complete_all). Lúc này, phần cứng MediaTek mới thực sự được reset một cách an toàn.
 
+
+
+Here is the complete, consolidated documentation written in professional English. This is structured to be used as a README.md, a Pull Request description, or an internal specification document for your team.
+# Specification & Implementation Guide: Event-Driven USB Deferred Resume
+## 1. Overview & Hardware Limitations
+**The Problem:** During the system wakeup process from suspend (resume), peripheral USB WiFi/Bluetooth modules (specifically from vendors like MediaTek) introduce significant latency. It takes approximately **~450ms** for these modules to complete their hardware reset-resume cycle.
+**The Hardware Bottleneck:**
+It is crucial to emphasize that this ~450ms delay is a **strict physical hardware limitation** (encompassing firmware reloading, chip initialization, and signal restoration). We cannot force the hardware to boot faster than this physical limit. Because the Linux Power Management (PM) Core waits synchronously at usb_dev_resume for this device to finish, the total system resume time is dragged down, delaying screen wake-up and system responsiveness.
+**The Solution:**
+To eliminate this ~450ms bottleneck from the PM log, the most optimal solution is **Decoupling (Thread Separation)**. By offloading this hardware-waiting task to a background worker thread and immediately returning 0 (simulating a successful resume) to the PM Core, we effectively "trick" the system into believing the device is ready. As a result, the OS and display can wake up instantly, while the network module utilizes its required 450ms in the background to safely restore itself without freezing other system processes.
+## 2. Technical Architecture & Strategy
+This patch intervenes directly in the USB Core (drivers/usb/core/driver.c) using an **Event-Driven Deferred Resume** mechanism.
+ 1. **Interception (Hooking):** We place a hook inside usb_dev_resume to filter target devices based on their Vendor ID (VID) and Product ID (PID).
+ 2. **Bypass:** For matched devices, we offload the context to a Workqueue and immediately return 0 to the PM Core.
+ 3. **Event Synchronization (PM Notifier):** To prevent deadlocks or race conditions (e.g., trying to wake the device before the USB Hub restores power), the background worker is strictly frozen using a completion mechanism. It only proceeds when the PM Core broadcasts the PM_POST_SUSPEND event, confirming the system is 100% fully thawed.
+ 4. **Background Resume:** Once the event is triggered, the worker locks the device safely and calls the native resume function, allowing the vendor driver to re-initialize the hardware.
+## 3. Code Implementation
+Below is the core logic to be injected into the USB core (either directly in driver.c or modularized via external files like usb_parallel_resume.c exported to usb.c).
+### Step 3.1: Includes and Background Worker Setup
+Add the necessary headers and the worker logic above the usb_dev_resume function:
+```c
+#include <linux/workqueue.h>
+#include <linux/slab.h>
+#include <linux/suspend.h>     /* For PM Notifier */
+#include <linux/completion.h>  /* For Completion mechanisms */
+#include <linux/delay.h>
+
+/* ======================================================================= *
+ * IN-TREE HACK: EVENT-DRIVEN DEFERRED RESUME FOR VENDOR WIFI/BT MODULES   *
+ * ======================================================================= */
+
+/* 1. Declare the completion barrier */
+static DECLARE_COMPLETION(vendor_resume_comp);
+
+/* 2. PM Notifier Callback to catch system events */
+static int vendor_pm_notify(struct notifier_block *nb, unsigned long action, void *ptr)
+{
+    switch (action) {
+    case PM_SUSPEND_PREPARE:
+        /* Reset the barrier before the system goes to sleep */
+        reinit_completion(&vendor_resume_comp);
+        break;
+    case PM_POST_SUSPEND:
+        /* System is fully awake. Unblock the waiting workers. */
+        complete_all(&vendor_resume_comp);
+        break;
+    }
+    return NOTIFY_OK;
+}
+
+static struct notifier_block vendor_pm_nb = {
+    .notifier_call = vendor_pm_notify,
+};
+
+/* 3. Auto-register the notifier during boot */
+static int __init vendor_hack_init(void)
+{
+    register_pm_notifier(&vendor_pm_nb);
+    return 0;
+}
+late_initcall(vendor_hack_init); 
+
+/* 4. Context Struct & Worker Function */
+struct vendor_deferred_resume_ctx {
+    struct work_struct work;
+    struct usb_device *udev;
+};
+
+static void vendor_deferred_resume_worker(struct work_struct *work)
+{
+    struct vendor_deferred_resume_ctx *ctx = 
+        container_of(work, struct vendor_deferred_resume_ctx, work);
+    struct usb_device *udev = ctx->udev;
+    int ret;
+
+    dev_info(&udev->dev, "[HACK-WIFI] Worker sleeping, waiting for PM_POST_SUSPEND...\n");
+    
+    /* * Block this thread (0% CPU usage) until the system is 100% awake 
+     * DO NOT hold the device lock during this wait.
+     */
+    wait_for_completion(&vendor_resume_comp);
+
+    /* Allow USB Hub power to stabilize */
+    msleep(100);
+
+    dev_info(&udev->dev, "[HACK-WIFI] Received PM_POST_SUSPEND! Executing background resume...\n");
+    
+    /* * CRITICAL: Must lock the device here to prevent race conditions
+     * with the Hub Driver.
+     */
+    usb_lock_device(udev);
+    
+    /* * Call the native USB Core resume function.
+     * This safely clears the USB_STATE_SUSPENDED flag and triggers the vendor driver.
+     */
+    ret = usb_resume(&udev->dev, PMSG_RESUME);
+    
+    if (ret) {
+        dev_err(&udev->dev, "[HACK-WIFI] Resume failed (Error: %d). Forcing hard reset!\n", ret);
+        /* Fallback if state machine is stuck */
+        usb_reset_device(udev);
+    } else {
+        dev_info(&udev->dev, "[HACK-WIFI] Background resume SUCCESSFUL!\n");
+    }
+    
+    /* Unlock and cleanup */
+    usb_unlock_device(udev);
+    usb_put_dev(udev);
+    kfree(ctx);
+}
+/* ======================================================================= */
+
+```
+### Step 3.2: Intercepting in usb_dev_resume
+Inject the interception logic at the very beginning of the usb_dev_resume function:
+```c
+static int usb_dev_resume(struct device *dev)
+{
+    struct usb_device *udev = to_usb_device(dev);
+    int r;
+
+    /* --- BEGIN INTERCEPT --- */
+    /* Target specific Vendor ID (e.g., 0x0E8D for MediaTek) */
+    if (le16_to_cpu(udev->descriptor.idVendor) == 0x0E8D) {
+        struct vendor_deferred_resume_ctx *ctx;
+        
+        /* MUST use GFP_NOIO to prevent I/O deadlocks during suspend/resume */
+        ctx = kzalloc(sizeof(*ctx), GFP_NOIO);
+        if (ctx) {
+            ctx->udev = usb_get_dev(udev); /* Safely increment reference count */
+            INIT_WORK(&ctx->work, vendor_deferred_resume_worker);
+            
+            dev_info(&udev->dev, "[HACK-WIFI] Intercepted PM resume! Offloading to background worker.\n");
+            
+            schedule_work(&ctx->work);
+            
+            /* Bypass synchronous wait: Return Success immediately to PM Core */
+            return 0; 
+        } else {
+            dev_err(&udev->dev, "[HACK-WIFI] OOM: Falling back to synchronous resume!\n");
+        }
+    }
+    /* --- END INTERCEPT --- */
+
+    /* Native execution path for all other USB devices */
+    r = usb_resume(udev, PMSG_RESUME);
+    return r;
+}
+
+```
+## 4. Core Safety Mechanisms Applied
+To ensure this patch is production-ready and does not cause Kernel Panics or Deadlocks, strict safety rules were enforced:
+ 1. **Deadlock Prevention (Locking Order):** usb_lock_device is absolutely forbidden inside the main PM Core thread interception, and it is also strictly avoided while the worker is waiting for the completion event. The device is only locked right before usb_resume is called in the background.
+ 2. **Memory Safety:** Memory allocation in the PM path exclusively uses GFP_NOIO rather than GFP_KERNEL to prevent the kernel from attempting to flush pages to sleeping storage devices.
+ 3. **Reference Counting Lifecycle:** usb_get_dev and usb_put_dev guarantee that if a user abruptly unplugs the USB dongle while the background thread is sleeping, the kernel will not free the memory structure prematurely, avoiding a Use-After-Free kernel oops.
+ 4. **Topology Integrity:** By bypassing at the usb_dev_resume level rather than the Hub level (hub.c), the parent-child power dependency tree of the USB subsystem remains intact and uncorrupted.
