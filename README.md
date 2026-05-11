@@ -51,3 +51,60 @@ deactivate SysPM
 note over SysPM, Device: All USB devices have been resumed\nwithout blocking the main dpm_resume process.
 
 @enduml
+
+
+
+
+@startuml
+skinparam maxMessageSize 200
+skinparam ActivityBackgroundColor #LightCyan
+skinparam ActivityBorderColor #006699
+
+title Flowchart of USB Parallel Resume Process
+
+start
+:System Wakeup Event;
+:System PM executes dpm_resume();
+
+while (Iterate through all devices) is (More devices)
+    if (Is it a USB Device?) then (Yes)
+        if (USB_PARALLEL_RESUME enabled\n& pointers != NULL?) then (Yes)
+            
+            if (Is it a USB Hub?) then (Yes)
+                :Call fn_ptr_invoke_instant_thread(hub);
+                if (Kant.M Model / SERDES Check?) then (Yes)
+                    :Execute usb_resume_serdes_timeout();
+                else (No)
+                endif
+                :Initialize Instant Thread for Hub;
+                
+            elseif (Is it a Priority Device?) then (Yes)
+                note right: e.g., BT, Zigbee IoT
+                :Call fn_ptr_perform_priority_device_operation(udev);
+                :Resume immediately (Synchronous);
+                
+            else (Normal USB Device)
+                :Add to Workqueue list;
+            endif
+            
+        else (No)
+            :Standard USB Resume (Sequential);
+        endif
+    else (No)
+        :Standard Device Resume;
+    endif
+endwhile (No more devices)
+
+:Call fn_ptr_usb_kick_wq_list() / wake_wq();
+
+fork
+    :Main thread continues system resume;
+fork again
+    :Workqueue processes remaining\nUSB devices in parallel;
+end fork
+
+:Resume Process Completed;
+stop
+
+@enduml
+
