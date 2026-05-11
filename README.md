@@ -11,44 +11,43 @@ participant "USB Core / Hub WQ\n(Workqueue)" as Hub
 participant "USB Device\n(BT, Zigbee IoT, ...)" as Device
 end box
 
-== 1. Giai đoạn Khởi tạo (Boot / Module Init) ==
+== 1. Initialization Phase (Boot / Module Init) ==
 Snapshot -> Snapshot : init_parallel_resume()
 activate Snapshot
-note right Snapshot: Đăng ký các con trỏ hàm:\n- fn_ptr_invoke_instant_thread\n- fn_ptr_perform_priority_device_operation\n- fn_ptr_usb_kick_wq_list\n...
+note right Snapshot: Register function pointers:\n- fn_ptr_invoke_instant_thread\n- fn_ptr_perform_priority_device_operation\n- fn_ptr_usb_kick_wq_list\n...
 deactivate Snapshot
 
-== 2. Giai đoạn Đánh thức Hệ thống (System Resume) ==
--> SysPM : Hệ thống bắt đầu thức dậy (Wakeup Event)
+== 2. System Wakeup Phase (System Resume) ==
+-> SysPM : System starts waking up (Wakeup Event)
 activate SysPM
 SysPM -> SysPM : dpm_resume() / dpm_resume_early()
-note right SysPM: Duyệt danh sách thiết bị.\nKhi gặp USB Device, kích hoạt\nblock code #USB_PARALLEL_RESUME
+note right SysPM: Iterate device list.\nWhen encountering a USB Device, trigger\ncode block #USB_PARALLEL_RESUME
 
-alt Nếu là USB Hub (Khởi tạo luồng xử lý nhanh)
-    SysPM -> Snapshot : Kiểm tra & Gọi fn_ptr_invoke_instant_thread(hub)
+alt If USB Hub (Initialize instant thread)
+    SysPM -> Snapshot : Check & Call fn_ptr_invoke_instant_thread(hub)
     activate Snapshot
-    Snapshot -> Snapshot : usb_resume_serdes_timeout() (Nếu cần)
-    Snapshot -> Hub : Khởi tạo luồng (Instant Thread) cho Hub
+    Snapshot -> Snapshot : usb_resume_serdes_timeout() (If needed)
+    Snapshot -> Hub : Initialize Instant Thread for Hub
     deactivate Snapshot
 end
 
-alt Nếu là Thiết bị ưu tiên (Priority Devices)
-    SysPM -> Snapshot : Gọi fn_ptr_perform_priority_device_operation(udev)
+alt If Priority Device
+    SysPM -> Snapshot : Call fn_ptr_perform_priority_device_operation(udev)
     activate Snapshot
-    Snapshot -> Device : Khôi phục trạng thái (Resume) ngay lập tức
+    Snapshot -> Device : Resume immediately
     deactivate Snapshot
 end
 
-== 3. Giai đoạn Kích hoạt Workqueue Song song ==
-SysPM -> Snapshot : Gọi fn_ptr_usb_kick_wq_list() / wake_wq()
+== 3. Parallel Workqueue Activation Phase ==
+SysPM -> Snapshot : Call fn_ptr_usb_kick_wq_list() / wake_wq()
 activate Snapshot
-Snapshot -> Hub : Kích hoạt các hàng đợi công việc (Workqueue)
+Snapshot -> Hub : Kick workqueues
 deactivate Snapshot
 
-Hub -> Device : Bắt đầu quá trình Reset/Resume song song\ncho các thiết bị USB còn lại
+Hub -> Device : Start parallel Reset/Resume process\nfor remaining USB devices
 deactivate SysPM
 
-== 4. Hoàn tất quá trình Resume ==
-note over SysPM, Device: Toàn bộ thiết bị USB đã được khôi phục\nmà không làm chặn (block) tiến trình dpm_resume chính.
+== 4. Resume Process Completed ==
+note over SysPM, Device: All USB devices have been resumed\nwithout blocking the main dpm_resume process.
 
 @enduml
-
